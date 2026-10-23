@@ -1,9 +1,9 @@
-"""Draws the Sort button sprites used by the plugin.
+"""Draws the Sort and Compact button sprites used by the plugin.
 
 usage: py -I tools/make_sprites.py [preview.png]
 
-Writes assets/sort_button.sprite (64x64 frames) and
-assets/sort_button.lowend.sprite (32x32 frames). D2R sprites are a 40-byte
+Writes assets/<icon>_button.sprite (64x64 frames) and
+assets/<icon>_button.lowend.sprite (32x32 frames) for each icon. D2R sprites are a 40-byte
 SpA1 header followed by uncompressed RGBA. Button frames sit side by side:
 normal, pressed, disabled, hovered.
 """
@@ -35,10 +35,8 @@ def inside_round_rect(x, y, x0, y0, x1, y1, r):
     return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
 
 
-def icon_coverage(x, y, offset):
+def sort_icon(x, y):
     """Three bars of decreasing length and a down arrow, in 64-unit space."""
-    x -= offset
-    y -= offset
     for top, length in ((18, 30), (29, 22), (40, 14)):
         if 12 <= x <= 12 + length and top <= y <= top + 6:
             return True
@@ -50,14 +48,37 @@ def icon_coverage(x, y, offset):
     return False
 
 
-def icon_outline(x, y, offset):
+def compact_icon(x, y):
+    """Packed blocks on the left and a dashed empty block on the right."""
+    for x0, y0, x1, y1 in ((12, 14, 22, 50), (25, 14, 34, 30), (25, 33, 34, 50)):
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return True
+    # Dashed outline of the free space.
+    x0, y0, x1, y1, stroke = 39, 14, 52, 50, 2.5
+    on_vertical = (x0 <= x <= x0 + stroke or x1 - stroke <= x <= x1) and y0 <= y <= y1
+    on_horizontal = (y0 <= y <= y0 + stroke or y1 - stroke <= y <= y1) and x0 <= x <= x1
+    if on_vertical and (y - y0) % 7 < 4.5:
+        return True
+    if on_horizontal and (x - x0) % 7 < 4.5:
+        return True
+    return False
+
+
+ICONS = {"sort": sort_icon, "compact": compact_icon}
+
+
+def icon_coverage(icon, x, y, offset):
+    return ICONS[icon](x - offset, y - offset)
+
+
+def icon_outline(icon, x, y, offset):
     for dx, dy in ((-1.5, 0), (1.5, 0), (0, -1.5), (0, 1.5), (1.5, 1.5)):
-        if icon_coverage(x + dx, y + dy, offset):
+        if icon_coverage(icon, x + dx, y + dy, offset):
             return True
     return False
 
 
-def draw_frame(kind, rng_seed=7):
+def draw_frame(kind, icon, rng_seed=7):
     rng = random.Random(rng_seed)
     size = FRAME * SS
     noise = [[rng.uniform(-1, 1) for _ in range(FRAME)] for _ in range(FRAME)]
@@ -85,14 +106,14 @@ def draw_frame(kind, rng_seed=7):
                         shade += 10
                     color = (shade, shade * 0.97, shade * 0.93)
                     offset = 1 if kind == "pressed" else 0
-                    if icon_coverage(x, y, offset):
+                    if icon_coverage(icon, x, y, offset):
                         if kind == "disabled":
                             color = (88, 86, 84)
                         else:
                             t = (y - 14) / 34
                             top = GOLD_HI if kind == "hovered" else mix(GOLD_HI, GOLD, 0.4)
                             color = mix(top, GOLD_DARK if kind == "pressed" else GOLD, max(0, min(1, t)))
-                    elif icon_outline(x, y, offset):
+                    elif icon_outline(icon, x, y, offset):
                         color = (12, 10, 8)
             if color is None:
                 pixels.append((0, 0, 0, 0))
@@ -177,14 +198,17 @@ def png(path, frames, scale=4):
 
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    frames = [draw_frame(kind) for kind in FRAMES]
-    low = [halve(frame) for frame in frames]
-    with open(os.path.join(root, "assets", "sort_button.sprite"), "wb") as f:
-        f.write(sprite(frames))
-    with open(os.path.join(root, "assets", "sort_button.lowend.sprite"), "wb") as f:
-        f.write(sprite(low))
+    previews = []
+    for icon in ICONS:
+        frames = [draw_frame(kind, icon) for kind in FRAMES]
+        low = [halve(frame) for frame in frames]
+        with open(os.path.join(root, "assets", icon + "_button.sprite"), "wb") as f:
+            f.write(sprite(frames))
+        with open(os.path.join(root, "assets", icon + "_button.lowend.sprite"), "wb") as f:
+            f.write(sprite(low))
+        previews.append(frames)
     if len(sys.argv) > 1:
-        png(sys.argv[1], frames)
+        png(sys.argv[1], [frame for frames in previews for frame in frames])
 
 
 if __name__ == "__main__":

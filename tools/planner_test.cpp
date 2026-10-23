@@ -2,14 +2,14 @@
 // replayed against the server rules (pick needs an empty cursor; place needs
 // free cells; swap needs exactly one overlapped item).
 //
-// usage: planner_test [cases-per-fill] [beam-width max-drops]
-// Without a beam width it runs Plan(), the same call the plugin makes.
+// usage: planner_test [sort|compact] [cases-per-fill]   success rates and move counts
+//        planner_test show                             example layouts for both modes
 
 #include "../src/inventory_planner.h"
 
 #include <chrono>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
 #include <random>
 
 using namespace InventoryPlanner;
@@ -24,9 +24,9 @@ struct Size {
 static constexpr Size Sizes[] = { { 2, 4 }, { 2, 3 }, { 2, 2 }, { 1, 3 }, { 1, 2 }, { 2, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 } };
 
 static auto Scatter(std::mt19937& rng, double fraction, Item* items) -> int {
-	bool used[Columns][Rows] {};
-	int  count = 0, area = 0;
-	const int goal = static_cast<int>(Columns * Rows * fraction);
+	bool      used[Columns][Rows] {};
+	int       count = 0, area = 0;
+	const int goal  = static_cast<int>(Columns * Rows * fraction);
 	for (int tries = 0; tries < 4'000 && area < goal; ++tries) {
 		const Size s = Sizes[rng() % (sizeof(Sizes) / sizeof(Sizes[0]))];
 		const int  x = static_cast<int>(rng() % (Columns - s.w + 1)), y = static_cast<int>(rng() % (Rows - s.h + 1));
@@ -54,9 +54,9 @@ static auto Scatter(std::mt19937& rng, double fraction, Item* items) -> int {
 	return count;
 }
 
-// Replays moves under the server rules. Returns an error or nullptr.
-static auto Replay(const Item* items, int count, const uint8_t* tx, const uint8_t* ty, const std::vector<Move>& moves) -> const char* {
-	int x[MaxItems], y[MaxItems];
+// Replays moves under the server rules and writes where the items end up.
+// Returns an error or nullptr.
+static auto Replay(const Item* items, int count, const std::vector<Move>& moves, int* x, int* y) -> const char* {
 	bool inGrid[MaxItems];
 	for (int k = 0; k < count; ++k) {
 		x[k] = items[k].x, y[k] = items[k].y, inGrid[k] = true;
@@ -102,45 +102,53 @@ static auto Replay(const Item* items, int count, const uint8_t* tx, const uint8_
 		}
 		}
 	}
-	if (hand >= 0) {
-		return "ends with an item on the cursor";
-	}
-	for (int k = 0; k < count; ++k) {
-		if (x[k] != tx[k] || y[k] != ty[k]) {
-			return "an item is not at its target";
-		}
-	}
-	return nullptr;
+	return hand >= 0 ? "ends with an item on the cursor" : nullptr;
 }
 
-// Prints every candidate layout for one inventory with its score.
-static void Show(const Item* items, int count) {
-	constexpr int LayoutCount = static_cast<int>(sizeof(Layouts) / sizeof(Layouts[0]));
-	static const char* const Names[] = { "tall", "large", "wide", "kind" };
-	for (int index = 0; index < LayoutCount; ++index) {
-		uint8_t tx[MaxItems], ty[MaxItems];
-		if (!Pack(items, count, Columns, Rows, Layouts[index].order, Layouts[index].fill, Layouts[index].smallFromRight, tx, ty)) {
-			std::printf("%s %s%s: does not pack\n", Names[static_cast<int>(Layouts[index].order)], Layouts[index].fill == PackFill::Contiguous ? "contiguous" : "backfill", Layouts[index].smallFromRight ? ", small items right" : "");
-			continue;
-		}
-		char grid[Rows][Columns + 1];
-		for (int y = 0; y < Rows; ++y) {
-			for (int x = 0; x < Columns; ++x) {
-				grid[y][x] = '.';
+// Area of the biggest item shape (from FreeShapes) that fits in the free cells.
+static auto BiggestFreeShape(const Item* items, int count, const int* x, const int* y) -> int {
+	bool used[Columns][Rows] {};
+	for (int k = 0; k < count; ++k) {
+		for (int cx = x[k]; cx < x[k] + items[k].width; ++cx) {
+			for (int cy = y[k]; cy < y[k] + items[k].height; ++cy) {
+				used[cx][cy] = true;
 			}
-			grid[y][Columns] = 0;
 		}
-		for (int k = 0; k < count; ++k) {
-			for (int x = tx[k]; x < tx[k] + items[k].width; ++x) {
-				for (int y = ty[k]; y < ty[k] + items[k].height; ++y) {
-					grid[y][x] = static_cast<char>('A' + k);
+	}
+	int best = 0;
+	for (const Shape& shape : FreeShapes) {
+		for (int sx = 0; sx + shape.width <= Columns; ++sx) {
+			for (int sy = 0; sy + shape.height <= Rows; ++sy) {
+				bool free = true;
+				for (int cx = sx; cx < sx + shape.width && free; ++cx) {
+					for (int cy = sy; cy < sy + shape.height && free; ++cy) {
+						free = !used[cx][cy];
+					}
+				}
+				if (free && shape.width * shape.height > best) {
+					best = shape.width * shape.height;
 				}
 			}
 		}
-		std::printf("%s %s%s:\n", Names[static_cast<int>(Layouts[index].order)], Layouts[index].fill == PackFill::Contiguous ? "contiguous" : "backfill", Layouts[index].smallFromRight ? ", small items right" : "");
-		for (int y = 0; y < Rows; ++y) {
-			std::printf("  %s\n", grid[y]);
+	}
+	return best;
+}
+
+static void PrintGrid(const Item* items, int count, const int* x, const int* y) {
+	char grid[Rows][Columns + 1];
+	for (int row = 0; row < Rows; ++row) {
+		std::memset(grid[row], '.', Columns);
+		grid[row][Columns] = 0;
+	}
+	for (int k = 0; k < count; ++k) {
+		for (int cx = x[k]; cx < x[k] + items[k].width; ++cx) {
+			for (int cy = y[k]; cy < y[k] + items[k].height; ++cy) {
+				grid[cy][cx] = static_cast<char>('A' + k);
+			}
 		}
+	}
+	for (int row = 0; row < Rows; ++row) {
+		std::printf("  %s\n", grid[row]);
 	}
 }
 
@@ -150,95 +158,94 @@ static auto Code(const char* text) -> uint32_t {
 	return code;
 }
 
+static void Show(const char* title, const Item* items, int count) {
+	int x[MaxItems], y[MaxItems];
+	std::printf("%s, as found:\n", title);
+	for (int k = 0; k < count; ++k) {
+		x[k] = items[k].x, y[k] = items[k].y;
+	}
+	PrintGrid(items, count, x, y);
+	for (const bool compact : { false, true }) {
+		std::vector<Move> moves;
+		const bool        found = compact ? PlanCompact(items, count, Columns, Rows, moves) : Plan(items, count, Columns, Rows, moves);
+		if (!found) {
+			std::printf("%s: no plan\n", compact ? "compact" : "sort");
+			continue;
+		}
+		const char* error = Replay(items, count, moves, x, y);
+		std::printf("%s: %zu moves%s%s, biggest free block %d cells\n", compact ? "compact" : "sort", moves.size(), error ? ", ILLEGAL: " : "", error ? error : "", BiggestFreeShape(items, count, x, y));
+		PrintGrid(items, count, x, y);
+		// Pressing the button again should find nothing to do.
+		Item again[MaxItems];
+		for (int k = 0; k < count; ++k) {
+			again[k] = items[k], again[k].x = x[k], again[k].y = y[k];
+		}
+		std::vector<Move> repeat;
+		const bool        repeated = compact ? PlanCompact(again, count, Columns, Rows, repeat) : Plan(again, count, Columns, Rows, repeat);
+		std::printf("  pressed again: %s\n", repeated ? (repeat.empty() ? "nothing to do" : "moves again") : "no plan");
+	}
+	std::printf("\n");
+}
+
 int main(int argc, char** argv) {
-	if (argc > 1 && std::strcmp(argv[1], "show") == 0) {
-		// The inventory from the in-game test: A-D weapons, E-G armor, H-I potions, J-K scrolls.
-		const Item mixed[] = {
-			{ 1, Code("lbw"), 0, 0, 0, 0, 2, 4 }, { 2, Code("spr"), 0, 0, 0, 0, 2, 4 }, { 3, Code("hax"), 0, 0, 0, 0, 1, 3 }, { 4, Code("dgr"), 0, 0, 0, 0, 1, 2 },
-			{ 5, Code("qui"), 1, 0, 0, 0, 2, 3 }, { 6, Code("cap"), 1, 0, 0, 0, 2, 2 }, { 7, Code("lbl"), 1, 0, 0, 0, 2, 1 }, { 8, Code("hp1"), 5, 0, 0, 0, 1, 1 },
-			{ 9, Code("hp1"), 5, 0, 0, 0, 1, 1 }, { 10, Code("isc"), 6, 0, 0, 0, 1, 1 }, { 11, Code("tsc"), 6, 0, 0, 0, 1, 1 },
+	const bool showOnly = argc > 1 && std::strcmp(argv[1], "show") == 0;
+	if (showOnly) {
+		// Gear and small items scattered over the grid with 6 free cells, so
+		// compact should leave a 2 x 3 block (body armor size).
+		const Item six[] = {
+			{ 1, Code("axe"), 0, 0, 3, 1, 2, 3 }, { 2, Code("buc"), 1, 0, 0, 0, 2, 2 }, { 3, Code("qui"), 1, 0, 7, 0, 2, 3 }, { 4, Code("hax"), 0, 0, 2, 0, 1, 3 },
+			{ 5, Code("cap"), 1, 0, 5, 2, 2, 2 }, { 6, Code("dgr"), 0, 0, 9, 2, 1, 2 }, { 7, Code("tbk"), 6, 0, 0, 2, 1, 2 }, { 8, Code("hp1"), 5, 0, 1, 2, 1, 1 },
+			{ 9, Code("hp1"), 5, 0, 3, 0, 1, 1 }, { 10, Code("mp1"), 5, 0, 5, 0, 1, 1 }, { 11, Code("gcv"), 4, 0, 6, 0, 1, 1 }, { 12, Code("r01"), 4, 0, 1, 3, 1, 1 },
+			{ 13, Code("key"), 7, 0, 9, 0, 1, 1 }, { 14, Code("amu"), 3, 0, 7, 3, 1, 1 },
 		};
-		Show(mixed, static_cast<int>(sizeof(mixed) / sizeof(mixed[0])));
-		// A lighter inventory with charms, jewelry, gems, runes, potions and keys.
-		const Item small[] = {
-			{ 1, Code("axe"), 0, 0, 0, 0, 2, 3 }, { 2, Code("buc"), 1, 0, 0, 0, 2, 2 }, { 3, Code("cm2"), 2, 0, 0, 0, 1, 2 }, { 4, Code("cm1"), 2, 0, 0, 0, 1, 1 },
-			{ 5, Code("rin"), 3, 0, 0, 0, 1, 1 }, { 6, Code("amu"), 3, 0, 0, 0, 1, 1 }, { 7, Code("gcv"), 4, 0, 0, 0, 1, 1 }, { 8, Code("gcv"), 4, 0, 0, 0, 1, 1 },
-			{ 9, Code("r01"), 4, 0, 0, 0, 1, 1 }, { 10, Code("hp1"), 5, 0, 0, 0, 1, 1 }, { 11, Code("hp1"), 5, 0, 0, 0, 1, 1 }, { 12, Code("hp1"), 5, 0, 0, 0, 1, 1 },
-			{ 13, Code("mp1"), 5, 0, 0, 0, 1, 1 }, { 14, Code("mp1"), 5, 0, 0, 0, 1, 1 }, { 15, Code("key"), 7, 0, 0, 0, 1, 1 }, { 16, Code("tbk"), 6, 0, 0, 0, 1, 2 },
-		};
-		std::printf("\n");
-		Show(small, static_cast<int>(sizeof(small) / sizeof(small[0])));
+		Show("Six free cells", six, static_cast<int>(sizeof(six) / sizeof(six[0])));
+		// The same gear without the small items: 13 free cells, room for a bow (2 x 4)
+		// and a helm (2 x 2) at best.
+		Show("Thirteen free cells", six, 7);
 		return 0;
 	}
-	const int cases = argc > 1 ? std::atoi(argv[1]) : 500;
-	Limits    limits;
-	if (argc > 2) {
-		limits.beamWidth = std::atoi(argv[2]);
-	}
-	if (argc > 3) {
-		limits.maxDepth = std::atoi(argv[3]);
-	}
-	int failures = 0;
+
+	const bool compact = argc > 1 && std::strcmp(argv[1], "compact") == 0;
+	const int  cases   = argc > 2 ? std::atoi(argv[2]) : 500;
+	int        failures = 0;
+	std::printf("%s mode\n", compact ? "compact" : "sort");
 	for (const double fraction : { 0.3, 0.5, 0.7, 0.85, 0.95, 1.0 }) {
-		int    ok = 0, fail = 0, nopack = 0, illegal = 0, worstMoves = 0, totalMoves = 0;
+		int    ok = 0, fail = 0, illegal = 0, worstMoves = 0, totalMoves = 0, freeBefore = 0, freeAfter = 0;
 		double slowest = 0, total = 0;
 		for (int seed = 0; seed < cases; ++seed) {
-			std::mt19937 rng(static_cast<uint32_t>(seed * 1'000 + fraction * 100));
-			Item         items[MaxItems];
-			const int    count = Scatter(rng, fraction, items);
-			uint8_t           tx[MaxItems], ty[MaxItems];
+			std::mt19937      rng(static_cast<uint32_t>(seed * 1'000 + fraction * 100));
+			Item              items[MaxItems];
+			const int         count = Scatter(rng, fraction, items);
 			std::vector<Move> moves;
-			const auto        t0     = std::chrono::steady_clock::now();
-			const bool        packed = Pack(items, count, Columns, Rows, PackOrder::WideFirst, PackFill::Backfill, false, tx, ty) || Pack(items, count, Columns, Rows, PackOrder::TallFirst, PackFill::Backfill, false, tx, ty);
-			const bool        found  = argc > 2 ? [&] {
-				for (const Layout& layout : Layouts) {
-					if (Pack(items, count, Columns, Rows, layout.order, layout.fill, layout.smallFromRight, tx, ty) && Search(items, count, Columns, Rows, tx, ty, moves, limits)) {
-						return true;
-					}
-				}
-				return false;
-			}() : Plan(items, count, Columns, Rows, moves);
-			if (found) {
-				// Recover the target the plan reached, for Replay.
-				int  x[MaxItems], y[MaxItems], hand = -1;
-				for (int k = 0; k < count; ++k) {
-					x[k] = items[k].x, y[k] = items[k].y;
-				}
-				for (const Move& m : moves) {
-					if (m.kind == MoveKind::Pick) {
-						hand = m.item;
-					} else {
-						x[m.item] = m.x, y[m.item] = m.y, hand = m.kind == MoveKind::Swap ? m.other : -1;
-					}
-				}
-				for (int k = 0; k < count; ++k) {
-					tx[k] = static_cast<uint8_t>(x[k]), ty[k] = static_cast<uint8_t>(y[k]);
-				}
-			}
-			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-			slowest         = ms > slowest ? ms : slowest;
+			const auto        t0    = std::chrono::steady_clock::now();
+			const bool        found = compact ? PlanCompact(items, count, Columns, Rows, moves) : Plan(items, count, Columns, Rows, moves);
+			const double      ms    = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+			slowest                 = ms > slowest ? ms : slowest;
 			total += ms;
-			if (!packed) {
-				++nopack;
-				continue;
-			}
 			if (!found) {
 				++fail;
 				continue;
 			}
-			if (const char* error = Replay(items, count, tx, ty, moves)) {
+			int x[MaxItems], y[MaxItems];
+			for (int k = 0; k < count; ++k) {
+				x[k] = items[k].x, y[k] = items[k].y;
+			}
+			freeBefore += BiggestFreeShape(items, count, x, y);
+			if (const char* error = Replay(items, count, moves, x, y)) {
 				++illegal;
 				if (illegal <= 3) {
 					std::printf("  illegal plan (fill %.2f, seed %d): %s\n", fraction, seed, error);
 				}
 				continue;
 			}
+			freeAfter += BiggestFreeShape(items, count, x, y);
 			++ok;
 			totalMoves += static_cast<int>(moves.size());
 			worstMoves = static_cast<int>(moves.size()) > worstMoves ? static_cast<int>(moves.size()) : worstMoves;
 		}
 		failures += illegal;
-		std::printf("fill %.2f: ok %d, no plan %d, cannot pack %d, illegal %d | avg %d, worst %d moves | avg %.1f ms, slowest %.1f ms\n", fraction, ok, fail, nopack, illegal, ok != 0 ? totalMoves / ok : 0, worstMoves, total / cases, slowest);
+		std::printf("fill %.2f: ok %d, no plan %d, illegal %d | avg %d, worst %d moves | biggest free block %.1f -> %.1f cells | avg %.1f ms, slowest %.1f ms\n", fraction, ok, fail, illegal, ok != 0 ? totalMoves / ok : 0, worstMoves,
+		            ok != 0 ? static_cast<double>(freeBefore) / ok : 0.0, ok != 0 ? static_cast<double>(freeAfter) / ok : 0.0, total / cases, slowest);
 	}
 	return failures == 0 ? 0 : 1;
 }

@@ -21,8 +21,10 @@
 
 #include "inventory_planner.h"
 
-// Adds a Sort button to the player inventory. Sorting plans a tidy layout and
-// every move to reach it first (inventory_planner.h), then moves items one at
+// Adds two buttons to the player inventory. Sort arranges items by kind;
+// Compact gathers the free cells into blocks an item fits in. Either way the
+// plugin plans the layout and every move to reach it first
+// (inventory_planner.h), then moves items one at
 // a time with the same client requests as a manual drag: grid to cursor,
 // cursor to grid, or cursor onto one item, which swaps it onto the cursor. The
 // game server checks every move, so nothing is created or destroyed, and it
@@ -33,18 +35,18 @@ static constexpr D2RL::PluginInfo InventorySortPluginInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "inventory-sort",
 	.name        = "Inventory Sort",
-	.version     = "0.1.0",
+	.version     = "0.2.0",
 	.author      = "Juan",
-	.description = "Adds a button to the inventory that sorts its items.",
+	.description = "Adds buttons to the inventory that sort its items or gather its free space.",
 	.flags       = D2RL::PluginFlags::Client,
 };
 
 static constexpr char DefaultConfig[] = R"(# Inventory Sort
-# Adds a button to the inventory that sorts its items.
+# Adds buttons to the inventory that sort its items or gather its free space.
 
 [inventory-sort]
-# Show the Sort button in the inventory. The inventory-sort console command
-# works either way.
+# Show the Sort and Compact buttons in the inventory. The inventory-sort and
+# inventory-compact console commands work either way.
 show_button = true
 
 # Inventory grid size. 0 reads it from the game data (10 x 4 in the base game).
@@ -56,12 +58,12 @@ log_moves = false
 )";
 
 // The child layout hangs off the stock inventory panel, so its coordinates are
-// the panel's: the button sits in the empty strip right of the gold display.
+// the panel's: the buttons sit in the empty strip right of the gold display.
 static constexpr char ButtonLayout[] = R"json({
 	"type": "Widget",
 	"name": "inventory-sort/SortButton",
 	"fields": {
-		"rect": { "x": 898, "y": 1340, "width": 64, "height": 64 }
+		"rect": { "x": 858, "y": 1340, "width": 144, "height": 64 }
 	},
 	"children": [
 		{
@@ -74,20 +76,36 @@ static constexpr char ButtonLayout[] = R"json({
 				"disabledFrame": 2,
 				"onClickMessage": "PanelManager:TogglePanel:inventory-sort/Sort",
 				"pressLabelOffset": { "x": 0, "y": 2 },
-				"tooltipString": "Sort inventory"
+				"tooltipString": "Sort inventory: group items by kind"
+			}
+		},
+		{
+			"type": "ButtonWidget",
+			"name": "inventory-sort/CompactButton",
+			"fields": {
+				"rect": { "x": 80, "y": 0 },
+				"filename": "d2rloader/inventory-sort/compact_button",
+				"hoveredFrame": 3,
+				"disabledFrame": 2,
+				"onClickMessage": "PanelManager:TogglePanel:inventory-sort/Compact",
+				"pressLabelOffset": { "x": 0, "y": 2 },
+				"tooltipString": "Compact inventory: keep the free space together"
 			}
 		}
 	]
 })json";
 
-// The button reuses a stock UI message so the layout parser accepts it. The
+// The buttons reuse a stock UI message so the layout parser accepts them. The
 // plugin consumes it before PanelManager sees it.
-static constexpr char ClickTarget[]  = "PanelManager";
-static constexpr char ClickCommand[] = "TogglePanel";
-static constexpr char ClickText[]    = "inventory-sort/Sort";
+static constexpr char ClickTarget[]      = "PanelManager";
+static constexpr char ClickCommand[]     = "TogglePanel";
+static constexpr char SortClickText[]    = "inventory-sort/Sort";
+static constexpr char CompactClickText[] = "inventory-sort/Compact";
 
-static constexpr int ButtonSpriteResource       = 101;
-static constexpr int ButtonLowEndSpriteResource = 102;
+static constexpr int SortSpriteResource          = 101;
+static constexpr int SortLowEndSpriteResource    = 102;
+static constexpr int CompactSpriteResource       = 103;
+static constexpr int CompactLowEndSpriteResource = 104;
 
 // D2RCore wraps D2R's client-to-server send with this function. It is a private
 // export, so its prologue is checked before use and sorting stays off when a
@@ -160,8 +178,14 @@ enum class JobState : uint32_t {
 	Moving   = 2,
 };
 
+enum class SortMode : uint32_t {
+	Sort    = 0, // group items by kind
+	Compact = 1, // gather the free cells into item-sized blocks
+};
+
 struct SortJob {
 	JobState                            state   = JobState::Idle;
+	SortMode                            mode    = SortMode::Sort;
 	D2RL::PlayerHandle                  player  = D2RL::InvalidPlayerHandle;
 	int                                 columns = 0;
 	int                                 rows    = 0;
@@ -783,9 +807,9 @@ static auto MatchesPlan(const Snapshot& now) noexcept -> bool {
 
 static void Finish(bool success, const char* reason = nullptr) noexcept {
 	if (success) {
-		Tellf(false, "Inventory sorted (%zu moves).", job.moves.size());
+		Tellf(false, job.mode == SortMode::Compact ? "Inventory compacted (%zu moves)." : "Inventory sorted (%zu moves).", job.moves.size());
 	} else {
-		Tellf(true, "Inventory sort stopped: %s", reason);
+		Tellf(true, job.mode == SortMode::Compact ? "Inventory compact stopped: %s" : "Inventory sort stopped: %s", reason);
 	}
 	job.state = JobState::Idle;
 #ifdef INVENTORY_SORT_TEST
@@ -830,7 +854,8 @@ static void SendNextMove() noexcept {
 static void PlanOnWorker() noexcept {
 	int result = PlanNone;
 	try {
-		result = InventoryPlanner::Plan(job.items, job.count, job.columns, job.rows, job.moves) ? PlanFound : PlanNone;
+		const bool found = job.mode == SortMode::Compact ? InventoryPlanner::PlanCompact(job.items, job.count, job.columns, job.rows, job.moves) : InventoryPlanner::Plan(job.items, job.count, job.columns, job.rows, job.moves);
+		result           = found ? PlanFound : PlanNone;
 	} catch (...) {
 		result = PlanNone;
 	}
@@ -855,7 +880,7 @@ static void __cdecl Tick(const D2RL::PluginContext* context, void*) noexcept {
 		}
 		if (job.moves.empty()) {
 			job.state = JobState::Idle;
-			Tellf(false, "The inventory is already sorted.");
+			Tellf(false, job.mode == SortMode::Compact ? "The inventory is already compact." : "The inventory is already sorted.");
 			return;
 		}
 		if (config.logMoves) {
@@ -893,7 +918,7 @@ static void __cdecl Tick(const D2RL::PluginContext* context, void*) noexcept {
 	}
 }
 
-static void StartSort(const D2RL::PluginContext* context) noexcept {
+static void StartSort(const D2RL::PluginContext* context, SortMode mode) noexcept {
 	if (job.state != JobState::Idle) {
 		return;
 	}
@@ -936,6 +961,7 @@ static void StartSort(const D2RL::PluginContext* context) noexcept {
 		}
 	}
 
+	job.mode    = mode;
 	job.player  = player;
 	job.columns = columns;
 	job.rows    = rows;
@@ -973,6 +999,7 @@ static void StartSort(const D2RL::PluginContext* context) noexcept {
 // <game>\d2rloader\inventory-sort-test.txt, so a test can run without clicks:
 //   fill <seed>   create test items at scattered cells (local games only)
 //   sort          press the Sort button
+//   compact       press the Compact button
 //   dump          log the inventory grid
 //   clear         destroy the items fill created
 //   purge         destroy every inventory item with a test item code
@@ -1163,7 +1190,9 @@ static void RunTestCommand(const D2RL::PluginContext* context, char* command) no
 			plugin->LogWarn("test: fill needs a local game.");
 		}
 	} else if (std::strcmp(command, "sort") == 0) {
-		StartSort(context);
+		StartSort(context, SortMode::Sort);
+	} else if (std::strcmp(command, "compact") == 0) {
+		StartSort(context, SortMode::Compact);
 	} else if (std::strcmp(command, "dump") == 0) {
 		DumpGrid(context, nullptr);
 	} else if (std::strncmp(command, "swap ", 5) == 0) {
@@ -1276,22 +1305,39 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext* context, const D2RL::
 	if (event == nullptr || event->structSize < D2RL::SharedEvents::UiMessageEventRequiredSize || event->target == nullptr || event->command == nullptr || event->text == nullptr) {
 		return D2RL::SharedEvents::UiMessageAction::Continue;
 	}
-	if (std::strcmp(event->target, ClickTarget) != 0 || std::strcmp(event->command, ClickCommand) != 0 || std::strcmp(event->text, ClickText) != 0) {
+	if (std::strcmp(event->target, ClickTarget) != 0 || std::strcmp(event->command, ClickCommand) != 0) {
 		return D2RL::SharedEvents::UiMessageAction::Continue;
 	}
-	StartSort(context);
+	if (std::strcmp(event->text, SortClickText) == 0) {
+		StartSort(context, SortMode::Sort);
+	} else if (std::strcmp(event->text, CompactClickText) == 0) {
+		StartSort(context, SortMode::Compact);
+	} else {
+		return D2RL::SharedEvents::UiMessageAction::Continue;
+	}
 	return D2RL::SharedEvents::UiMessageAction::Consume;
 }
 
-static void __cdecl StartSortOnUiThread(const D2RL::PluginContext* context, void*) noexcept {
-	StartSort(context);
+static constexpr SortMode SortModes[] = { SortMode::Sort, SortMode::Compact };
+
+static void __cdecl StartSortOnUiThread(const D2RL::PluginContext* context, void* userData) noexcept {
+	StartSort(context, *static_cast<const SortMode*>(userData));
 }
 
-static auto SortCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
+static auto RunCommand(const D2RL::ConsoleCommandContext* command, const SortMode* mode) noexcept -> D2RL::ConsoleCommandResult {
 	if (command == nullptr || command->plugin == nullptr) {
 		return D2RL::ConsoleCommandResult::Failed;
 	}
-	return threads->runOnUiThread(command->plugin, StartSortOnUiThread, nullptr) == D2RL::Threads::Result::Success ? D2RL::ConsoleCommandResult::Handled : D2RL::ConsoleCommandResult::Failed;
+	void* userData = const_cast<SortMode*>(mode);
+	return threads->runOnUiThread(command->plugin, StartSortOnUiThread, userData) == D2RL::Threads::Result::Success ? D2RL::ConsoleCommandResult::Handled : D2RL::ConsoleCommandResult::Failed;
+}
+
+static auto SortCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
+	return RunCommand(command, &SortModes[0]);
+}
+
+static auto CompactCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
+	return RunCommand(command, &SortModes[1]);
 }
 
 static auto RegisterBytes(const D2RL::ResourceService* resources, const char* path, const void* bytes, uint64_t size) noexcept -> bool {
@@ -1335,8 +1381,10 @@ static auto AddButton(const D2RL::PluginContext* context) noexcept -> bool {
 
 	HMODULE module = nullptr;
 	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&AddButton), &module);
-	if (!RegisterSprite(resources, module, ButtonSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/sort_button.sprite")
-	    || !RegisterSprite(resources, module, ButtonLowEndSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/sort_button.lowend.sprite")
+	if (!RegisterSprite(resources, module, SortSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/sort_button.sprite")
+	    || !RegisterSprite(resources, module, SortLowEndSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/sort_button.lowend.sprite")
+	    || !RegisterSprite(resources, module, CompactSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/compact_button.sprite")
+	    || !RegisterSprite(resources, module, CompactLowEndSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/compact_button.lowend.sprite")
 	    || !RegisterBytes(resources, "data/global/ui/layouts/inventory-sort/SortButtonhd.json", ButtonLayout, sizeof(ButtonLayout) - 1)) {
 		return false;
 	}
@@ -1426,7 +1474,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	if (config.showButton) {
 		buttonReady = ListenForClicks(context) && AddButton(context);
 	}
-	(void)context->RegisterConsoleCommand("inventory-sort", SortCommand, "Sort the items in your inventory.");
+	(void)context->RegisterConsoleCommand("inventory-sort", SortCommand, "Sort the items in your inventory by kind.");
+	(void)context->RegisterConsoleCommand("inventory-compact", CompactCommand, "Move your inventory items so the free space stays together.");
 #ifdef INVENTORY_SORT_TEST
 	const D2RL::Lifecycle::GameplayEventListener testListener {
 		.structSize = D2RL::Lifecycle::GameplayEventListenerSize,

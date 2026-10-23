@@ -101,11 +101,16 @@ inline auto ComesFirst(const Item& a, const Item& b, PackOrder order) noexcept -
 	return a.id < b.id;
 }
 
+// Cells a packing must leave free.
+struct Mask {
+	bool used[MaxSide][MaxSide];
+};
+
 // First fit, filling each column top to bottom before moving right. With
 // smallFromRight, single-cell items instead fill from the right edge inward,
 // the way players keep potions and scrolls apart from their gear. Writes each
-// item's target top-left cell.
-inline auto Pack(const Item* items, int count, int columns, int rows, PackOrder order, PackFill fill, bool smallFromRight, uint8_t* targetX, uint8_t* targetY) noexcept -> bool {
+// item's target top-left cell. Cells set in blocked stay empty.
+inline auto Pack(const Item* items, int count, int columns, int rows, PackOrder order, PackFill fill, bool smallFromRight, uint8_t* targetX, uint8_t* targetY, const Mask* blocked = nullptr) noexcept -> bool {
 	int sorted[MaxItems];
 	for (int index = 0; index < count; ++index) {
 		sorted[index] = index;
@@ -113,6 +118,9 @@ inline auto Pack(const Item* items, int count, int columns, int rows, PackOrder 
 	std::sort(sorted, sorted + count, [&](int a, int b) { return ComesFirst(items[a], items[b], order); });
 
 	bool used[MaxSide][MaxSide] {};
+	if (blocked != nullptr) {
+		std::memcpy(used, blocked->used, sizeof(used));
+	}
 	int  lastX = 0, lastY = 0;
 	for (int rank = 0; rank < count; ++rank) {
 		const Item& item  = items[sorted[rank]];
@@ -552,6 +560,166 @@ inline auto Plan(const Item* items, int count, int columns, int rows, std::vecto
 		}
 	}
 	return false;
+}
+
+// ---- Compact -----------------------------------------------------------------
+
+struct Shape {
+	uint8_t width;
+	uint8_t height;
+};
+
+// Free blocks the compact layout tries to keep, biggest first, and of equal
+// areas the shape more items have (2 x 2 before 1 x 4). These are inventory
+// sizes of real items, so the space left can take one: six free cells become
+// a 2 x 3 block, the size of body armor.
+inline constexpr Shape FreeShapes[] = { { 2, 4 }, { 2, 3 }, { 2, 2 }, { 1, 4 }, { 1, 3 }, { 2, 1 }, { 1, 2 } };
+
+// Tight packings for the items around the free blocks.
+inline constexpr Layout CompactLayouts[] = {
+	{ PackOrder::TallFirst, PackFill::Backfill, false },
+	{ PackOrder::LargeFirst, PackFill::Backfill, false },
+	{ PackOrder::WideFirst, PackFill::Backfill, false },
+	{ PackOrder::KindFirst, PackFill::Backfill, false },
+};
+
+struct Targets {
+	uint8_t x[MaxItems];
+	uint8_t y[MaxItems];
+};
+
+inline auto PackAround(const Item* items, int count, int columns, int rows, const Mask& blocked, Targets& targets) noexcept -> bool {
+	for (const Layout& layout : CompactLayouts) {
+		if (Pack(items, count, columns, rows, layout.order, layout.fill, layout.smallFromRight, targets.x, targets.y, &blocked)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Free blocks a layout already has: FreeShapes cut from its free cells, biggest
+// first. Returns their areas in that order.
+inline auto FreeBlocks(const Item* items, int count, int columns, int rows, const uint8_t* x, const uint8_t* y) -> std::vector<int> {
+	bool used[MaxSide][MaxSide] {};
+	for (int k = 0; k < count; ++k) {
+		for (int cx = x[k]; cx < x[k] + items[k].width; ++cx) {
+			for (int cy = y[k]; cy < y[k] + items[k].height; ++cy) {
+				used[cx][cy] = true;
+			}
+		}
+	}
+	std::vector<int> areas;
+	for (const Shape& shape : FreeShapes) {
+		for (int sx = 0; sx + shape.width <= columns; ++sx) {
+			for (int sy = 0; sy + shape.height <= rows; ++sy) {
+				bool free = true;
+				for (int cx = sx; cx < sx + shape.width && free; ++cx) {
+					for (int cy = sy; cy < sy + shape.height && free; ++cy) {
+						free = !used[cx][cy];
+					}
+				}
+				if (!free) {
+					continue;
+				}
+				for (int cx = sx; cx < sx + shape.width; ++cx) {
+					for (int cy = sy; cy < sy + shape.height; ++cy) {
+						used[cx][cy] = true;
+					}
+				}
+				areas.push_back(shape.width * shape.height);
+			}
+		}
+	}
+	return areas;
+}
+
+// Target layouts for compacting, best first: the most free blocks kept, then
+// fewer, then none (items packed tightly). Writes the areas of the blocks the
+// best one keeps.
+inline auto CompactCandidates(const Item* items, int count, int columns, int rows, std::vector<int>& kept) -> std::vector<Targets> {
+	kept.clear();
+	int freeCells = columns * rows;
+	for (int k = 0; k < count; ++k) {
+		freeCells -= items[k].width * items[k].height;
+	}
+
+	std::vector<Targets> stages;
+	Mask                 blocked {};
+	Targets              targets {};
+	for (int round = 0; round < 4; ++round) {
+		bool accepted = false;
+		for (const Shape& shape : FreeShapes) {
+			if (shape.width * shape.height > freeCells) {
+				continue;
+			}
+			// Keep the block toward the bottom-right corner.
+			for (int x = columns - shape.width; x >= 0 && !accepted; --x) {
+				for (int y = rows - shape.height; y >= 0 && !accepted; --y) {
+					bool free = true;
+					for (int cx = x; cx < x + shape.width && free; ++cx) {
+						for (int cy = y; cy < y + shape.height && free; ++cy) {
+							free = !blocked.used[cx][cy];
+						}
+					}
+					if (!free) {
+						continue;
+					}
+					Mask trial = blocked;
+					for (int cx = x; cx < x + shape.width; ++cx) {
+						for (int cy = y; cy < y + shape.height; ++cy) {
+							trial.used[cx][cy] = true;
+						}
+					}
+					if (PackAround(items, count, columns, rows, trial, targets)) {
+						blocked = trial;
+						freeCells -= shape.width * shape.height;
+						stages.push_back(targets);
+						kept.push_back(shape.width * shape.height);
+						accepted = true;
+					}
+				}
+			}
+			if (accepted) {
+				break;
+			}
+		}
+		if (!accepted) {
+			break;
+		}
+	}
+
+	std::vector<Targets> candidates(stages.rbegin(), stages.rend());
+	if (PackAround(items, count, columns, rows, Mask {}, targets)) {
+		candidates.push_back(targets);
+	}
+	return candidates;
+}
+
+// Like Plan, but for the compact layouts. A full inventory has no space to
+// gather, so when no compact layout can be reached it sorts instead.
+inline auto PlanCompact(const Item* items, int count, int columns, int rows, std::vector<Move>& moves) -> bool {
+	std::vector<int>           kept;
+	const std::vector<Targets> candidates = CompactCandidates(items, count, columns, rows, kept);
+
+	// Nothing to do when the free space already has blocks at least this big.
+	uint8_t x[MaxItems], y[MaxItems];
+	for (int k = 0; k < count; ++k) {
+		x[k] = static_cast<uint8_t>(items[k].x), y[k] = static_cast<uint8_t>(items[k].y);
+	}
+	if (!kept.empty() && FreeBlocks(items, count, columns, rows, x, y) >= kept) {
+		moves.clear();
+		return true;
+	}
+
+	for (const int beamWidth : { 48, 256 }) {
+		const Limits limits { .beamWidth = beamWidth };
+		for (const Targets& targets : candidates) {
+			if (Search(items, count, columns, rows, targets.x, targets.y, moves, limits)) {
+				return true;
+			}
+		}
+	}
+	return Plan(items, count, columns, rows, moves);
 }
 
 } // namespace InventoryPlanner
