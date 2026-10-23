@@ -21,12 +21,18 @@ gold in the title bar, the buttons move to the title bar, right of the title.
 - With more free space it keeps the biggest block first, then the next.
 - Item order doesn't matter in this mode.
 
+Both leave the Horadric Cube, the Tome of Town Portal and the Tome of Identify
+where they are, and arrange everything else around them. `locked_items` in the
+settings changes which items stay put.
+
 Both work in single player and when you join a TCP/IP game.
 
 The plugin moves items the same way you would by hand: pick up, put down, or
-drop onto another item to swap it. The game checks each move, so the plugin
-can't create or duplicate items. It works out every move before it starts, so
-when the inventory can't be sorted, nothing moves.
+drop onto another item to swap it. It never drops an item onto the Horadric
+Cube (the game refuses that), onto a tome with its own scrolls, or onto an
+item of the same kind, since those drops don't swap. The game checks each
+move, so the plugin can't create or duplicate items. It works out every move
+before it starts, so when the inventory can't be sorted, nothing moves.
 
 ## Install
 
@@ -57,6 +63,11 @@ rows = 0
 # active mod's inventory grid covers that strip.
 button_x = 0
 button_y = 0
+
+# Item codes that Sort and Compact leave where they are. The default keeps the
+# Horadric Cube (box) and the Tomes of Town Portal (tbk) and Identify (ibk) in
+# place. Leave it empty to move everything.
+locked_items = "box tbk ibk"
 
 # Write every move to d2rloader\logs\inventory-sort.log.
 log_moves = false

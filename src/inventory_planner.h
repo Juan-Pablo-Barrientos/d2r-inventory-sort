@@ -30,7 +30,18 @@ struct Item {
 	int      y;
 	int      width;
 	int      height;
+	bool     locked = false; // stays where it is; the rest is arranged around it
+	// Drops onto some items don't swap: the game refuses them onto the Horadric
+	// Cube, a tome takes in its scrolls, and stackable items join a stack of the
+	// same code. The search never drops an item onto one of these.
+	bool     refusesDrops = false;
+	uint32_t absorbs      = 0; // code of the items it takes in, 0 for none
 };
+
+// True when dropping held onto target swaps them.
+inline auto CanSwapOnto(const Item& held, const Item& target) noexcept -> bool {
+	return !target.locked && !target.refusesDrops && held.code != target.code && (target.absorbs == 0 || target.absorbs != held.code);
+}
 
 enum class MoveKind : uint8_t {
 	Pick  = 0, // item goes from the grid to the cursor
@@ -109,7 +120,8 @@ struct Mask {
 // First fit, filling each column top to bottom before moving right. With
 // smallFromRight, single-cell items instead fill from the right edge inward,
 // the way players keep potions and scrolls apart from their gear. Writes each
-// item's target top-left cell. Cells set in blocked stay empty.
+// item's target top-left cell. Cells set in blocked stay empty, and locked
+// items keep their cells.
 inline auto Pack(const Item* items, int count, int columns, int rows, PackOrder order, PackFill fill, bool smallFromRight, uint8_t* targetX, uint8_t* targetY, const Mask* blocked = nullptr) noexcept -> bool {
 	int sorted[MaxItems];
 	for (int index = 0; index < count; ++index) {
@@ -121,11 +133,23 @@ inline auto Pack(const Item* items, int count, int columns, int rows, PackOrder 
 	if (blocked != nullptr) {
 		std::memcpy(used, blocked->used, sizeof(used));
 	}
+	for (int k = 0; k < count; ++k) {
+		if (!items[k].locked) {
+			continue;
+		}
+		for (int cx = items[k].x; cx < items[k].x + items[k].width; ++cx) {
+			for (int cy = items[k].y; cy < items[k].y + items[k].height; ++cy) {
+				used[cx][cy] = true;
+			}
+		}
+		targetX[k] = static_cast<uint8_t>(items[k].x);
+		targetY[k] = static_cast<uint8_t>(items[k].y);
+	}
 	int  lastX = 0, lastY = 0;
 	for (int rank = 0; rank < count; ++rank) {
 		const Item& item  = items[sorted[rank]];
 		bool        found = false;
-		if (smallFromRight && item.width == 1 && item.height == 1) {
+		if (item.locked || (smallFromRight && item.width == 1 && item.height == 1)) {
 			continue;
 		}
 		for (int x = fill == PackFill::Contiguous ? lastX : 0; x + item.width <= columns && !found; ++x) {
@@ -161,7 +185,7 @@ inline auto Pack(const Item* items, int count, int columns, int rows, PackOrder 
 	int x = columns - 1, y = 0;
 	for (int rank = 0; rank < count; ++rank) {
 		const Item& item = items[sorted[rank]];
-		if (item.width != 1 || item.height != 1) {
+		if (item.locked || item.width != 1 || item.height != 1) {
 			continue;
 		}
 		while (x >= 0 && used[x][y]) {
@@ -241,6 +265,7 @@ struct Problem {
 	uint8_t  targetX[MaxItems];
 	uint8_t  targetY[MaxItems];
 	int32_t  base[MaxItems];
+	bool     locked[MaxItems];
 	int16_t  targetOwner[MaxCells];
 	uint64_t cellKey[MaxItems][MaxCells];
 	uint64_t handKey[MaxItems + 1];
@@ -414,6 +439,10 @@ inline auto Search(const Item* items, int count, int columns, int rows, const ui
 		p.targetX[k] = targetX[k];
 		p.targetY[k] = targetY[k];
 		p.base[k]    = items[k].width * items[k].height * WeightAway + 1;
+		p.locked[k]  = items[k].locked;
+		if (items[k].locked && (targetX[k] != items[k].x || targetY[k] != items[k].y)) {
+			return false;
+		}
 		for (int cx = targetX[k]; cx < targetX[k] + items[k].width; ++cx) {
 			for (int cy = targetY[k]; cy < targetY[k] + items[k].height; ++cy) {
 				p.targetOwner[Cell(cx, cy)] = static_cast<int16_t>(k);
@@ -455,7 +484,7 @@ inline auto Search(const Item* items, int count, int columns, int rows, const ui
 			const uint8_t* pos  = &positions[static_cast<size_t>(index) * count];
 			const View     v(p, pos, node.hand);
 			for (int k = 0; k < count; ++k) {
-				if (node.hand >= 0 ? k != node.hand : !v.Away(k)) {
+				if (node.hand >= 0 ? k != node.hand : (p.locked[k] || !v.Away(k))) {
 					continue;
 				}
 				const int  kx      = pos[k] & 15, ky = pos[k] >> 4;
@@ -480,7 +509,9 @@ inline auto Search(const Item* items, int count, int columns, int rows, const ui
 								}
 							}
 						}
-						if (!valid) {
+						// The hit item must swap onto the cursor: not locked, and
+						// not an item that refuses or absorbs the drop.
+						if (!valid || (hit >= 0 && !CanSwapOnto(items[k], items[hit]))) {
 							continue;
 						}
 						// The hash covers grid items and which item is held, not
@@ -643,9 +674,17 @@ inline auto CompactCandidates(const Item* items, int count, int columns, int row
 		freeCells -= items[k].width * items[k].height;
 	}
 
+	// Free blocks can't include the cells of locked items.
 	std::vector<Targets> stages;
 	Mask                 blocked {};
 	Targets              targets {};
+	for (int k = 0; k < count; ++k) {
+		for (int cx = items[k].x; items[k].locked && cx < items[k].x + items[k].width; ++cx) {
+			for (int cy = items[k].y; cy < items[k].y + items[k].height; ++cy) {
+				blocked.used[cx][cy] = true;
+			}
+		}
+	}
 	for (int round = 0; round < 4; ++round) {
 		bool accepted = false;
 		for (const Shape& shape : FreeShapes) {

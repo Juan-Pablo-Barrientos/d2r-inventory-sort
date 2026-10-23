@@ -36,7 +36,7 @@ static constexpr D2RL::PluginInfo InventorySortPluginInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "inventory-sort",
 	.name        = "Inventory Sort",
-	.version     = "0.3.0",
+	.version     = "0.4.0",
 	.author      = "Juan",
 	.description = "Adds buttons to the inventory that sort its items or gather its free space.",
 	.flags       = D2RL::PluginFlags::Client,
@@ -59,6 +59,11 @@ rows = 0
 # active mod's inventory grid covers that strip.
 button_x = 0
 button_y = 0
+
+# Item codes that Sort and Compact leave where they are. The default keeps the
+# Horadric Cube (box) and the Tomes of Town Portal (tbk) and Identify (ibk) in
+# place. Leave it empty to move everything.
+locked_items = "box tbk ibk"
 
 # Write every move to the plugin log.
 log_moves = false
@@ -162,6 +167,9 @@ struct Config {
 	int  buttonX    = 0;
 	int  buttonY    = 0;
 	bool logMoves   = false;
+	// Items that stay where they are: the Horadric Cube and the two tomes.
+	uint32_t lockedCodes[16] { D2RL::Items::MakeItemCode("box"), D2RL::Items::MakeItemCode("tbk"), D2RL::Items::MakeItemCode("ibk") };
+	int      lockedCount = 3;
 };
 
 struct ItemSize {
@@ -300,6 +308,52 @@ static auto ReadGridSide(const char* value) noexcept -> int {
 	return side >= 1 && side <= MaxGridSide ? side : 0;
 }
 
+// Reads item codes separated by spaces or commas, quoted or not. Codes shorter
+// than four characters are padded with spaces, as in the game data.
+static void ReadItemCodes(const char* value) noexcept {
+	config.lockedCount = 0;
+	const auto isCodeChar = [](char c) noexcept { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
+	while (*value != 0 && *value != '#') {
+		if (!isCodeChar(*value)) {
+			++value;
+			continue;
+		}
+		char code[4] { ' ', ' ', ' ', ' ' };
+		int  length = 0;
+		for (; isCodeChar(*value); ++value, ++length) {
+			if (length < 4) {
+				code[length] = *value;
+			}
+		}
+		if (length <= 4 && config.lockedCount < static_cast<int>(sizeof(config.lockedCodes) / sizeof(config.lockedCodes[0]))) {
+			config.lockedCodes[config.lockedCount++] = D2RL::Items::MakeItemCode(code[0], code[1], code[2], code[3]);
+		}
+	}
+}
+
+static auto IsLocked(uint32_t code) noexcept -> bool {
+	for (int index = 0; index < config.lockedCount; ++index) {
+		if (config.lockedCodes[index] == code) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The game refuses drops onto the Horadric Cube (checked in game), and a tome
+// takes in its scrolls instead of swapping with them.
+static constexpr uint32_t HoradricCube = D2RL::Items::MakeItemCode("box");
+
+static auto AbsorbedCode(uint32_t code) noexcept -> uint32_t {
+	if (code == D2RL::Items::MakeItemCode("tbk")) {
+		return D2RL::Items::MakeItemCode("tsc");
+	}
+	if (code == D2RL::Items::MakeItemCode("ibk")) {
+		return D2RL::Items::MakeItemCode("isc");
+	}
+	return 0;
+}
+
 static void LoadConfig() noexcept {
 	config = {};
 	char text[4'096] {};
@@ -326,6 +380,8 @@ static void LoadConfig() noexcept {
 			config.buttonY = std::atoi(buttonY);
 		} else if (const char* logMoves = ReadValue(line, "log_moves")) {
 			config.logMoves = std::strncmp(logMoves, "true", 4) == 0;
+		} else if (const char* locked = ReadValue(line, "locked_items")) {
+			ReadItemCodes(locked);
 		}
 	}
 }
@@ -995,7 +1051,7 @@ static void StartSort(const D2RL::PluginContext* context, SortMode mode) noexcep
 	job.moves.clear();
 	for (int index = 0; index < scratch.count; ++index) {
 		const GridItem& item = scratch.items[index];
-		job.items[index]     = { item.runtimeId, item.code, item.group, item.quality, item.x, item.y, item.width, item.height };
+		job.items[index]     = { item.runtimeId, item.code, item.group, item.quality, item.x, item.y, item.width, item.height, IsLocked(item.code), item.code == HoradricCube, AbsorbedCode(item.code) };
 		job.x[index]         = item.x;
 		job.y[index]         = item.y;
 	}
@@ -1064,7 +1120,7 @@ static void __cdecl DumpGrid(const D2RL::PluginContext* context, void*) noexcept
 	for (int index = 0; index < testScratch.count; ++index) {
 		const GridItem& item = testScratch.items[index];
 		char            code[5] {};
-		Logf(false, "test: %c = %s %dx%d group %d id=%u at %d,%d", 'A' + index % 26, CodeText(item.code, code), item.width, item.height, item.group, item.runtimeId, item.x, item.y);
+		Logf(false, "test: %c = %s %dx%d group %d id=%u at %d,%d%s", 'A' + index % 26, CodeText(item.code, code), item.width, item.height, item.group, item.runtimeId, item.x, item.y, IsLocked(item.code) ? " locked" : "");
 		for (int y = item.y; y < item.y + item.height && y < rows; ++y) {
 			for (int x = item.x; x < item.x + item.width && x < columns; ++x) {
 				overlap    = overlap || grid[y][x] != '.';

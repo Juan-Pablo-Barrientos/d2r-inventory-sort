@@ -2,7 +2,7 @@
 // replayed against the server rules (pick needs an empty cursor; place needs
 // free cells; swap needs exactly one overlapped item).
 //
-// usage: planner_test [sort|compact] [cases-per-fill] [columns rows]   success rates and move counts
+// usage: planner_test [sort|compact][+locked] [cases-per-fill] [columns rows]   success rates and move counts
 //        planner_test show                             example layouts for both modes
 
 #include "../src/inventory_planner.h"
@@ -72,6 +72,9 @@ static auto Replay(const Item* items, int count, const std::vector<Move>& moves,
 			if (hand >= 0 || !inGrid[m.item]) {
 				return "pick with a busy cursor or an item not in the grid";
 			}
+			if (items[m.item].locked) {
+				return "pick of a locked item";
+			}
 			hand = m.item, inGrid[m.item] = false;
 			break;
 		case MoveKind::Place:
@@ -93,6 +96,12 @@ static auto Replay(const Item* items, int count, const std::vector<Move>& moves,
 			}
 			if (m.kind == MoveKind::Swap && (hits != 1 || hit != m.other)) {
 				return "swap without exactly the named item";
+			}
+			if (m.kind == MoveKind::Swap && items[hit].locked) {
+				return "swap that picks up a locked item";
+			}
+			if (m.kind == MoveKind::Swap && !CanSwapOnto(items[hand], items[hit])) {
+				return "drop onto an item the game doesn't swap (cube, tome, stack)";
 			}
 			x[hand] = m.x, y[hand] = m.y, inGrid[hand] = true;
 			hand = -1;
@@ -206,14 +215,17 @@ int main(int argc, char** argv) {
 		return 0;
 	}
 
-	const bool compact = argc > 1 && std::strcmp(argv[1], "compact") == 0;
+	// A mode ending in "+locked" (sort+locked, compact+locked) locks the first
+	// three items of each inventory, the way the cube and tomes are locked.
+	const bool compact = argc > 1 && std::strncmp(argv[1], "compact", 7) == 0;
+	const bool locked  = argc > 1 && std::strstr(argv[1], "+locked") != nullptr;
 	const int  cases   = argc > 2 ? std::atoi(argv[2]) : 500;
 	if (argc > 4) {
 		Columns = std::atoi(argv[3]);
 		Rows    = std::atoi(argv[4]);
 	}
 	int        failures = 0;
-	std::printf("%s mode\n", compact ? "compact" : "sort");
+	std::printf("%s mode%s, %d x %d\n", compact ? "compact" : "sort", locked ? " with locked items" : "", Columns, Rows);
 	for (const double fraction : { 0.3, 0.5, 0.7, 0.85, 0.95, 1.0 }) {
 		int    ok = 0, fail = 0, illegal = 0, worstMoves = 0, totalMoves = 0, freeBefore = 0, freeAfter = 0;
 		double slowest = 0, total = 0;
@@ -221,6 +233,13 @@ int main(int argc, char** argv) {
 			std::mt19937      rng(static_cast<uint32_t>(seed * 1'000 + fraction * 100));
 			Item              items[MaxItems];
 			const int         count = Scatter(rng, fraction, items);
+			for (int k = 0; locked && k < count && k < 3; ++k) {
+				items[k].locked = true;
+			}
+			// An unlocked cube: the game refuses drops onto it.
+			if (locked && count > 3) {
+				items[3].refusesDrops = true;
+			}
 			std::vector<Move> moves;
 			const auto        t0    = std::chrono::steady_clock::now();
 			const bool        found = compact ? PlanCompact(items, count, Columns, Rows, moves) : Plan(items, count, Columns, Rows, moves);
