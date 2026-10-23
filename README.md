@@ -3,6 +3,10 @@
 A [D2RLoader](https://d2rloader.net) plugin for Diablo II: Resurrected. It adds
 two buttons to the inventory, in the empty strip right of the gold display.
 
+Mods with a bigger inventory work too. The grid size comes from the game data,
+and when the mod's grid covers that strip, as in 13 x 8 inventories with the
+gold in the title bar, the buttons move to the title bar, right of the title.
+
 **Sort** arranges items by kind:
 
 - Gear goes on the left: weapons first, then armor, bigger items first.
@@ -48,6 +52,12 @@ show_button = true
 columns = 0
 rows = 0
 
+# Where the buttons go, in inventory panel units (top-left of the Sort button).
+# 0 picks a spot: right of the gold display, or in the title bar when the
+# active mod's inventory grid covers that strip.
+button_x = 0
+button_y = 0
+
 # Write every move to d2rloader\logs\inventory-sort.log.
 log_moves = false
 ```
@@ -67,5 +77,6 @@ Messages appear in the D2RLoader console and in `inventory-sort.log`.
 Run `build.ps1` (Visual Studio 2022 C++ tools). `-Install` copies the DLL into
 the game. `-PlannerTest` builds and runs `tools/planner_test.cpp`, which plans
 thousands of random inventories and replays every move against the server's
-rules (`-PlannerArgs "compact"` for the Compact button, `"show"` for example
-layouts). `tools/make_sprites.py` draws the buttons.
+rules (`-PlannerArgs "compact"` for the Compact button, `"sort 100 13 8"` for a
+13 x 8 grid, `"show"` for example layouts). `tools/make_sprites.py` draws the
+buttons.

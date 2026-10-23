@@ -2,7 +2,7 @@
 // replayed against the server rules (pick needs an empty cursor; place needs
 // free cells; swap needs exactly one overlapped item).
 //
-// usage: planner_test [sort|compact] [cases-per-fill]   success rates and move counts
+// usage: planner_test [sort|compact] [cases-per-fill] [columns rows]   success rates and move counts
 //        planner_test show                             example layouts for both modes
 
 #include "../src/inventory_planner.h"
@@ -14,8 +14,9 @@
 
 using namespace InventoryPlanner;
 
-static constexpr int Columns = 10;
-static constexpr int Rows    = 4;
+// Grid size; the base game has 10 x 4. Arguments 3 and 4 change it.
+static int Columns = 10;
+static int Rows    = 4;
 
 struct Size {
 	int w, h;
@@ -24,7 +25,7 @@ struct Size {
 static constexpr Size Sizes[] = { { 2, 4 }, { 2, 3 }, { 2, 2 }, { 1, 3 }, { 1, 2 }, { 2, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 } };
 
 static auto Scatter(std::mt19937& rng, double fraction, Item* items) -> int {
-	bool      used[Columns][Rows] {};
+	bool      used[MaxSide][MaxSide] {};
 	int       count = 0, area = 0;
 	const int goal  = static_cast<int>(Columns * Rows * fraction);
 	for (int tries = 0; tries < 4'000 && area < goal; ++tries) {
@@ -107,7 +108,7 @@ static auto Replay(const Item* items, int count, const std::vector<Move>& moves,
 
 // Area of the biggest item shape (from FreeShapes) that fits in the free cells.
 static auto BiggestFreeShape(const Item* items, int count, const int* x, const int* y) -> int {
-	bool used[Columns][Rows] {};
+	bool used[MaxSide][MaxSide] {};
 	for (int k = 0; k < count; ++k) {
 		for (int cx = x[k]; cx < x[k] + items[k].width; ++cx) {
 			for (int cy = y[k]; cy < y[k] + items[k].height; ++cy) {
@@ -135,7 +136,7 @@ static auto BiggestFreeShape(const Item* items, int count, const int* x, const i
 }
 
 static void PrintGrid(const Item* items, int count, const int* x, const int* y) {
-	char grid[Rows][Columns + 1];
+	char grid[MaxSide][MaxSide + 1];
 	for (int row = 0; row < Rows; ++row) {
 		std::memset(grid[row], '.', Columns);
 		grid[row][Columns] = 0;
@@ -207,6 +208,10 @@ int main(int argc, char** argv) {
 
 	const bool compact = argc > 1 && std::strcmp(argv[1], "compact") == 0;
 	const int  cases   = argc > 2 ? std::atoi(argv[2]) : 500;
+	if (argc > 4) {
+		Columns = std::atoi(argv[3]);
+		Rows    = std::atoi(argv[4]);
+	}
 	int        failures = 0;
 	std::printf("%s mode\n", compact ? "compact" : "sort");
 	for (const double fraction : { 0.3, 0.5, 0.7, 0.85, 0.95, 1.0 }) {

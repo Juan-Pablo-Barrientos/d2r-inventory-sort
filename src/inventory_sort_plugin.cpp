@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <atomic>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,7 +36,7 @@ static constexpr D2RL::PluginInfo InventorySortPluginInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "inventory-sort",
 	.name        = "Inventory Sort",
-	.version     = "0.2.0",
+	.version     = "0.3.0",
 	.author      = "Juan",
 	.description = "Adds buttons to the inventory that sort its items or gather its free space.",
 	.flags       = D2RL::PluginFlags::Client,
@@ -53,17 +54,33 @@ show_button = true
 columns = 0
 rows = 0
 
+# Where the buttons go, in inventory panel units (top-left of the Sort button).
+# 0 picks a spot: right of the gold display, or in the title bar when the
+# active mod's inventory grid covers that strip.
+button_x = 0
+button_y = 0
+
 # Write every move to the plugin log.
 log_moves = false
 )";
 
 // The child layout hangs off the stock inventory panel, so its coordinates are
-// the panel's: the buttons sit in the empty strip right of the gold display.
-static constexpr char ButtonLayout[] = R"json({
+// the panel's. The base game has an empty strip right of the gold display.
+// Mods that enlarge the grid over that strip get the buttons in the title bar,
+// right of the title and across from their gold display.
+static constexpr int StripButtonX = 858;
+static constexpr int StripButtonY = 1340;
+static constexpr int TitleButtonX = 1080;
+static constexpr int TitleButtonY = 68;
+static constexpr int ButtonsWidth = 144;
+static constexpr int ButtonHeight = 64;
+static constexpr int GridCellSize = 98; // $ItemCellSize in HD layouts
+
+static constexpr char ButtonLayoutFormat[] = R"json({
 	"type": "Widget",
 	"name": "inventory-sort/SortButton",
 	"fields": {
-		"rect": { "x": 858, "y": 1340, "width": 144, "height": 64 }
+		"rect": { "x": %d, "y": %d, "width": %d, "height": %d }
 	},
 	"children": [
 		{
@@ -142,6 +159,8 @@ struct Config {
 	bool showButton = true;
 	int  columns    = 0;
 	int  rows       = 0;
+	int  buttonX    = 0;
+	int  buttonY    = 0;
 	bool logMoves   = false;
 };
 
@@ -301,6 +320,10 @@ static void LoadConfig() noexcept {
 			config.columns = ReadGridSide(columns);
 		} else if (const char* rows = ReadValue(line, "rows")) {
 			config.rows = ReadGridSide(rows);
+		} else if (const char* buttonX = ReadValue(line, "button_x")) {
+			config.buttonX = std::atoi(buttonX);
+		} else if (const char* buttonY = ReadValue(line, "button_y")) {
+			config.buttonY = std::atoi(buttonY);
 		} else if (const char* logMoves = ReadValue(line, "log_moves")) {
 			config.logMoves = std::strncmp(logMoves, "true", 4) == 0;
 		}
@@ -1367,6 +1390,159 @@ static auto RegisterSprite(const D2RL::ResourceService* resources, HMODULE modul
 	return RegisterBytes(resources, path, bytes, SizeofResource(module, info));
 }
 
+// ---- Button position ------------------------------------------------------
+
+// The game reads the expansion layout for LoD and RotW characters; it is based
+// on the original layout and usually inherits the grid from it.
+static constexpr const wchar_t* InventoryLayoutFiles[] = {
+	L"playerinventoryexpansionlayouthd.json",
+	L"playerinventoryoriginallayouthd.json",
+};
+
+static constexpr LONGLONG MaxLayoutBytes = 4 * 1'024 * 1'024;
+
+struct GridRect {
+	int x       = -1;
+	int y       = -1;
+	int columns = -1;
+	int rows    = -1;
+};
+
+static auto ReadTextFile(const wchar_t* path, std::vector<char>& text) noexcept -> bool {
+	const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	LARGE_INTEGER size {};
+	bool          ok = GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= MaxLayoutBytes;
+	if (ok) {
+		try {
+			text.assign(static_cast<size_t>(size.QuadPart) + 1, 0);
+		} catch (...) {
+			ok = false;
+		}
+	}
+	DWORD read = 0;
+	ok         = ok && ReadFile(file, text.data(), static_cast<DWORD>(size.QuadPart), &read, nullptr) && read == static_cast<DWORD>(size.QuadPart);
+	CloseHandle(file);
+	return ok;
+}
+
+static auto SkipSpace(const char* text) noexcept -> const char* {
+	while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
+		++text;
+	}
+	return text;
+}
+
+// Finds "key": between from and end and returns the value after the colon.
+static auto FindKey(const char* from, const char* end, const char* key) noexcept -> const char* {
+	char quoted[32] {};
+	std::snprintf(quoted, sizeof(quoted), "\"%s\"", key);
+	const size_t length = std::strlen(quoted);
+	for (const char* at = from; at + length <= end; ++at) {
+		if (std::memcmp(at, quoted, length) == 0) {
+			const char* rest = SkipSpace(at + length);
+			if (*rest == ':') {
+				return SkipSpace(rest + 1);
+			}
+		}
+	}
+	return nullptr;
+}
+
+// Reads { "x": n, "y": n } stored under key.
+static auto ReadPoint(const char* from, const char* end, const char* key, int* x, int* y) noexcept -> bool {
+	const char* object = FindKey(from, end, key);
+	if (object == nullptr || *object != '{') {
+		return false;
+	}
+	const char* close = object;
+	while (close < end && *close != '}') {
+		++close;
+	}
+	const char* xValue = FindKey(object, close, "x");
+	const char* yValue = FindKey(object, close, "y");
+	if (xValue == nullptr || yValue == nullptr) {
+		return false;
+	}
+	*x = static_cast<int>(std::strtol(xValue, nullptr, 10));
+	*y = static_cast<int>(std::strtol(yValue, nullptr, 10));
+	return true;
+}
+
+// Fills in what this layout says about the widget named "grid".
+static void ReadLayoutGrid(const std::vector<char>& text, GridRect* grid) noexcept {
+	const char* end = text.data() + text.size() - 1;
+	for (const char* name = FindKey(text.data(), end, "name"); name != nullptr; name = FindKey(name, end, "name")) {
+		if (std::strncmp(name, "\"grid\"", 6) != 0) {
+			continue;
+		}
+		const char* next  = FindKey(name, end, "name");
+		const char* until = next != nullptr ? next : end;
+		if (grid->x < 0) {
+			(void)ReadPoint(name, until, "rect", &grid->x, &grid->y);
+		}
+		if (grid->columns < 0) {
+			(void)ReadPoint(name, until, "cellCount", &grid->columns, &grid->rows);
+		}
+		return;
+	}
+}
+
+// Reads the inventory grid from the active mod's layouts. False when the mod
+// keeps the stock layouts or they cannot be read.
+static auto ReadModGrid(const D2RL::PluginContext* context, GridRect* grid, wchar_t (&found)[MAX_PATH]) noexcept -> bool {
+	if (context->contextSize < offsetof(D2RL::PluginContext, modDirectory) + sizeof(context->modDirectory) || context->modDirectory == nullptr || context->modDirectory[0] == 0) {
+		return false;
+	}
+	const char* mod = context->activeMod != nullptr ? context->activeMod : "";
+	wchar_t     folders[2][MAX_PATH] {};
+	swprintf_s(folders[0], L"%ls\\data\\global\\ui\\layouts", context->modDirectory);
+	swprintf_s(folders[1], L"%ls\\%hs.mpq\\data\\global\\ui\\layouts", context->modDirectory, mod);
+
+	std::vector<char> text;
+	for (const auto& folder : folders) {
+		for (const wchar_t* file : InventoryLayoutFiles) {
+			wchar_t path[MAX_PATH] {};
+			swprintf_s(path, L"%ls\\%ls", folder, file);
+			if (ReadTextFile(path, text)) {
+				ReadLayoutGrid(text, grid);
+				if (found[0] == 0) {
+					wcscpy_s(found, path);
+				}
+			}
+		}
+		if (found[0] != 0) {
+			break;
+		}
+	}
+	return grid->x >= 0 && grid->columns > 0 && grid->rows > 0;
+}
+
+static void PickButtonPosition(const D2RL::PluginContext* context, int* x, int* y) noexcept {
+	*x = StripButtonX;
+	*y = StripButtonY;
+	GridRect grid;
+	wchar_t  found[MAX_PATH] {};
+	if (ReadModGrid(context, &grid, found)) {
+		const int  right   = grid.x + grid.columns * GridCellSize;
+		const int  bottom  = grid.y + grid.rows * GridCellSize;
+		const bool covered = StripButtonX < right && grid.x < StripButtonX + ButtonsWidth && StripButtonY < bottom && grid.y < StripButtonY + ButtonHeight;
+		if (covered) {
+			*x = TitleButtonX;
+			*y = TitleButtonY;
+		}
+		Logf(false, "The mod's inventory grid is %d x %d at %d,%d (%ls). Buttons go in the %s.", grid.columns, grid.rows, grid.x, grid.y, found, covered ? "title bar" : "strip by the gold display");
+	}
+	if (config.buttonX != 0) {
+		*x = config.buttonX;
+	}
+	if (config.buttonY != 0) {
+		*y = config.buttonY;
+	}
+}
+
 static auto AddButton(const D2RL::PluginContext* context) noexcept -> bool {
 	const D2RL::ResourceService* resources = nullptr;
 	const D2RL::PanelService*    panels    = nullptr;
@@ -1379,13 +1555,20 @@ static auto AddButton(const D2RL::PluginContext* context) noexcept -> bool {
 		return false;
 	}
 
+	int buttonX = 0;
+	int buttonY = 0;
+	PickButtonPosition(context, &buttonX, &buttonY);
+	char layout[sizeof(ButtonLayoutFormat) + 64] {};
+	const int layoutLength = std::snprintf(layout, sizeof(layout), ButtonLayoutFormat, buttonX, buttonY, ButtonsWidth, ButtonHeight);
+	Logf(false, "Buttons at %d,%d.", buttonX, buttonY);
+
 	HMODULE module = nullptr;
 	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&AddButton), &module);
 	if (!RegisterSprite(resources, module, SortSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/sort_button.sprite")
 	    || !RegisterSprite(resources, module, SortLowEndSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/sort_button.lowend.sprite")
 	    || !RegisterSprite(resources, module, CompactSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/compact_button.sprite")
 	    || !RegisterSprite(resources, module, CompactLowEndSpriteResource, "data/hd/global/ui/d2rloader/inventory-sort/compact_button.lowend.sprite")
-	    || !RegisterBytes(resources, "data/global/ui/layouts/inventory-sort/SortButtonhd.json", ButtonLayout, sizeof(ButtonLayout) - 1)) {
+	    || !RegisterBytes(resources, "data/global/ui/layouts/inventory-sort/SortButtonhd.json", layout, static_cast<uint64_t>(layoutLength))) {
 		return false;
 	}
 
